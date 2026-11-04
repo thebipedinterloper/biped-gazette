@@ -17,7 +17,7 @@
 
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: Georgia, serif; }
-    #ar { position: fixed; inset: 0; }
+    #ar { position: fixed; inset: 0; touch-action: none; }
     #start {
       position: fixed; inset: 0; z-index: 10;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -29,6 +29,7 @@
       position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5;
       background: rgba(255,255,255,0.9); color: #000; padding: 6px 12px; border-radius: 4px;
       font-size: 12px; line-height: 1.4; display: none; max-width: 92%; text-align: center;
+      pointer-events: none;
     }
   </style>
 </head>
@@ -47,7 +48,7 @@
     import { getFirestore, collection, getDocs } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
     // ============================================================
-    // TEST SWITCHES
+    // TEST SWITCHES AND TUNING
     // ============================================================
     // Where the map is centred:
     //   'gps'           = the reader's position (Point Nemo if location fails)
@@ -55,8 +56,19 @@
     const CENTER_MODE = 'gps';
 
     const SHOW_DEBUG_OUTLINE = false;  // green outline of the blank area
-    const SHOW_EYE_DEBUG     = false;  // little squares where the camera reads the paper
     const SHOW_STATUS        = true;   // the information line at the top of the screen
+
+    // Fingertip on paper
+    const HOLD_MS            = 800;    // how long a fingertip must rest to select or grab (ms)
+    const HOLD_STEADINESS    = 0.8;    // share of readings during the hold that must see the finger
+    const SLIDER_COOLDOWN_MS = 800;    // after letting go, the bar ignores the paper for this long
+
+    // Tracking steadiness
+    const TRACK_FILTER_MIN_CF = 0.0001;  // MindAR: lower = less jitter
+    const TRACK_FILTER_BETA   = 10;      // MindAR: higher = less lag
+    const TRACK_WARMUP_FRAMES = 5;       // frames before the page counts as found
+    const TRACK_MISS_FRAMES   = 15;      // frames without the page before it counts as lost
+    const DISPLAY_SMOOTHING   = 0.35;    // 0.1 = very steady but soft, 1 = no extra smoothing
 
     // ============================================================
     // FIREBASE (your web app config)
@@ -78,7 +90,6 @@
     const PAGE_WIDTH_CM  = 21.0;   // A4 portrait
     const PAGE_HEIGHT_CM = 29.7;
 
-    // The blank drawing area (inner edge of the thick bar)
     const BLANK_AREA_CM = { left: 3.24, top: 3.11, right: 17.74, bottom: 26.61 };
     const BLANK_CENTER_CM = {
       x: (BLANK_AREA_CM.left + BLANK_AREA_CM.right) / 2,
@@ -86,35 +97,37 @@
     };
     const BLANK_WIDTH_CM = BLANK_AREA_CM.right - BLANK_AREA_CM.left;     // 14.5 cm
 
-    // The scale slider: the thin white line in the LEFT side of the thick bar
-    const SLIDER_CM = { x: 3.00, bottomY: 26.87, topY: 2.80 };           // bottom = closest, top = world
+    // Scale slider: thin white line in the LEFT side of the thick bar (bottom = closest, top = world)
+    const SLIDER_CM = { x: 3.00, bottomY: 26.87, topY: 2.80 };
     const SLIDER_LENGTH_CM = SLIDER_CM.bottomY - SLIDER_CM.topY;         // 24.07 cm
     const SLIDER_READ_X_CM = 2.75;     // the eye reads the black stretch just left of the white line
+    const SLIDER_TOUCH_CM  = 1.5;      // screen backup: a touch within 1.5 cm of the line grabs it
 
-    // The edition circles: one row under the word EDITION
+    // Edition circles: one row under the word EDITION
     const EDITION_ROW_CM = { centerX: 10.5, centerY: 29.15 };
-    const EDITION_CIRCLE_CM = 1.0;     // 1 cm across
+    const EDITION_CIRCLE_CM = 1.0;
     const EDITION_GAP_CM    = 0.4;
     const EDITION_LINE_CM   = 0.035;   // about 1 pt
+    const EDITION_TOUCH_CM  = 0.9;     // screen backup: a tap within 9 mm of a circle counts
 
     // Tree dots and line detection
-    const DOT_DIAMETER_CM       = 0.3;   // 3 mm, always the same on paper
-    const LINE_CATCH_RADIUS_CM  = 0.5;   // a line counts if it passes within 5 mm of the tree's spot
-    const LINE_CONFIRM_TICKS    = 5;     // the mark must be seen 5 times in a row (half a second)
+    const DOT_DIAMETER_CM      = 0.3;  // 3 mm, always the same on paper
+    const LINE_CATCH_RADIUS_CM = 0.5;  // a line counts if it passes within 5 mm of the tree's spot
+    const LINE_CONFIRM_TICKS   = 5;    // the mark must be seen 5 reads in a row (half a second)
 
     // The eye
-    const EYE_TICK_MS     = 100;       // how often the paper is read
-    const EYE_WIDTH_PX    = 960;       // resolution the camera image is read at
-    const COVER_DISTANCE  = 45;        // how different a point must look to count as "covered"
-    const HOLD_MS         = 2000;      // fingertip hold time
+    const EYE_TICK_MS    = 100;
+    const EYE_WIDTH_PX   = 960;
+    const COVER_DISTANCE = 45;         // white paper: how different a point must look to count as covered
+    const BAR_BRIGHTER   = 45;         // black bar: how much brighter a point must look (a fingertip on ink)
 
     const GREEN = 0x00ff00;
 
     function cmToPage(xCm, yCm) {
-      return {
-        x: (xCm - PAGE_WIDTH_CM / 2) / PAGE_WIDTH_CM,
-        y: (PAGE_HEIGHT_CM / 2 - yCm) / PAGE_WIDTH_CM
-      };
+      return { x: (xCm - PAGE_WIDTH_CM / 2) / PAGE_WIDTH_CM, y: (PAGE_HEIGHT_CM / 2 - yCm) / PAGE_WIDTH_CM };
+    }
+    function pageToCm(x, y) {
+      return { x: x * PAGE_WIDTH_CM + PAGE_WIDTH_CM / 2, y: PAGE_HEIGHT_CM / 2 - y * PAGE_WIDTH_CM };
     }
     function cmToUnits(cm) { return cm / PAGE_WIDTH_CM; }
 
@@ -174,8 +187,8 @@
     let trees = [];
     let editions = [];
     let selectedEdition = null;
-    const foundTrees = new Set();        // tree ids found by a line in this session
-    const lineStreak = new Map();        // tree id -> how many reads in a row a line was seen
+    const foundTrees = new Set();
+    const lineStreak = new Map();
 
     async function loadTrees() {
       const snapshot = await getDocs(collection(db, 'curatedTree'));
@@ -192,7 +205,6 @@
     }
     const treesReady = loadTrees();
 
-    // Trees of the chosen edition that fall inside the blank area, with their paper position
     function treesOnPage() {
       if (selectedEdition === null) return [];
       return trees
@@ -207,7 +219,6 @@
     const statusEl = document.getElementById('status');
     let mapFound = false;
     let dataProblem = '';
-    let sliderNote = '';
 
     function refreshStatus() {
       if (!SHOW_STATUS) { statusEl.style.display = 'none'; return; }
@@ -215,14 +226,14 @@
       if (dataProblem) {
         text += ' · ' + dataProblem;
       } else if (selectedEdition === null) {
-        text += ' · Choose an edition: hold a finger on a number for 2 s';
+        text += ' · Rest a fingertip on an edition number';
       } else {
         const onPage = treesOnPage();
         const foundOnPage = onPage.filter(o => foundTrees.has(o.tree.id)).length;
         text += ' · Edition ' + selectedEdition + ' · ' + onPage.length + ' on the page, ' + foundOnPage + ' found · ' +
                 scaleLabel() + ' · centre: ' + center.source;
       }
-      if (sliderNote) text += ' · ' + sliderNote;
+      if (slider.grabbed) text += ' · sliding…';
       statusEl.textContent = text;
     }
 
@@ -253,7 +264,6 @@
       return () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return ((s >>> 0) % 100000) / 100000; };
     }
 
-    // An irregular round green blob, 3 mm across, its shape seeded by the tree
     function makeBlob(seedText) {
       const random = seededRandom(hashString(seedText));
       const pointCount = 9;
@@ -276,7 +286,6 @@
       return new THREE.Mesh(new THREE.ShapeGeometry(shape, 12), new THREE.MeshBasicMaterial({ color: GREEN }));
     }
 
-    // A circled number: black stroke, black number (texture on a small square)
     function makeEditionCircle(number) {
       const px = 256;
       const canvas = document.createElement('canvas');
@@ -313,7 +322,8 @@
     // ============================================================
     // EDITION CIRCLES
     // ============================================================
-    let editionExpanded = true;     // true = all numbers shown; false = only the chosen one
+    let editionExpanded = true;
+    let editionGroup, editionFills = [];
 
     function editionListPositions() {
       const pitch = EDITION_CIRCLE_CM + EDITION_GAP_CM;
@@ -326,13 +336,11 @@
       return [{ edition: selectedEdition, x: EDITION_ROW_CM.centerX, y: EDITION_ROW_CM.centerY }];
     }
 
-    let editionGroup, editionFills = [];
     function buildEditionRow() {
       clearGroup(editionGroup);
       editionFills = [];
       visibleEditionCircles().forEach((c) => {
         const p = cmToPage(c.x, c.y);
-        // Green fill: full when this edition is the chosen one, growing while a finger holds it
         const fill = new THREE.Mesh(
           new THREE.CircleGeometry(cmToUnits(EDITION_CIRCLE_CM) / 2 * 0.97, 40),
           new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0 })
@@ -355,11 +363,26 @@
       });
     }
 
+    // What happens when an edition circle is chosen (by finger or by screen tap)
+    function chooseEditionCircle(c) {
+      if (editionExpanded) { selectedEdition = c.edition; editionExpanded = false; }
+      else { editionExpanded = true; }
+      buildEditionRow();
+      buildTreeDots();
+      refreshStatus();
+    }
+
     // ============================================================
     // SCALE TICK and TREE DOTS
     // ============================================================
     let tickMesh, holdMarker, treeGroup;
-    let builtScaleT = null, builtEdition = undefined, builtFoundCount = -1;
+    let builtScaleT = null;
+
+    const slider = {
+      grabbed: false, viaScreen: false,
+      holdY: null, holdStart: 0, holdReads: 0, holdHits: 0,
+      lastY: null, lastSeen: 0, cooldownUntil: 0
+    };
 
     function placeTick() {
       const yCm = SLIDER_CM.bottomY + (SLIDER_CM.topY - SLIDER_CM.bottomY) * scaleT;
@@ -367,8 +390,15 @@
       tickMesh.position.set(p.x, p.y, 0.002);
       tickMesh.scale.set(1, slider.grabbed ? 2.2 : 1, 1);
     }
+    function yToScaleT(yCm) {
+      return Math.min(1, Math.max(0, (SLIDER_CM.bottomY - yCm) / SLIDER_LENGTH_CM));
+    }
+    function setScaleT(t) {
+      scaleT = t;
+      placeTick();
+      if (builtScaleT === null || Math.abs(scaleT - builtScaleT) > 0.002) buildTreeDots();
+    }
 
-    // Only trees that have been found by a line are drawn
     function buildTreeDots() {
       clearGroup(treeGroup);
       treesOnPage().forEach(({ tree, paper }) => {
@@ -379,8 +409,6 @@
         treeGroup.add(blob);
       });
       builtScaleT = scaleT;
-      builtEdition = selectedEdition;
-      builtFoundCount = foundTrees.size;
     }
 
     // ============================================================
@@ -390,7 +418,7 @@
     const eyeCtx = eyeCanvas.getContext('2d', { willReadFrequently: true });
     let eyePixels = null;
     const tmpVec = new THREE.Vector3();
-    let view = null;     // { anchorGroup, camera, canvasRect, videoRect } for this read
+    let view = null;
 
     function captureFrame(video) {
       const vw = video.videoWidth, vh = video.videoHeight;
@@ -403,7 +431,7 @@
       return true;
     }
 
-    // A point on the paper (cm) -> a pixel in the captured frame
+    // Uses the exact tracked position (not the smoothed display), for precise reading
     function paperToEyePixel(xCm, yCm) {
       const p = cmToPage(xCm, yCm);
       tmpVec.set(p.x, p.y, 0).applyMatrix4(view.anchorGroup.matrixWorld).project(view.camera);
@@ -434,8 +462,10 @@
     }
     const lum = (c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
 
-    // ---------- Reading points for the edition circles and the slider ----------
-    function makeSample(xCm, yCm) { return { xCm, yCm, base: null, covered: false, debug: null }; }
+    // ---------- Reading points (edition circles and slider) ----------
+    // kind 'paper' = white paper: covered when clearly different
+    // kind 'bar'   = black ink:   covered only when clearly BRIGHTER (a fingertip on the bar)
+    function makeSample(xCm, yCm, kind) { return { xCm, yCm, kind, base: null, covered: false }; }
 
     const CIRCLE_INNER = [[0,0],[0.22,0],[-0.22,0],[0,0.22],[0,-0.22],[0.16,0.16],[-0.16,0.16],[0.16,-0.16],[-0.16,-0.16]];
     const CIRCLE_OUTER_RADIUS = 0.95;
@@ -445,9 +475,9 @@
       const key = xCm.toFixed(2) + ',' + yCm.toFixed(2);
       if (!circleSampleCache.has(key)) {
         circleSampleCache.set(key, {
-          inner: CIRCLE_INNER.map(([dx, dy]) => makeSample(xCm + dx, yCm - dy)),
+          inner: CIRCLE_INNER.map(([dx, dy]) => makeSample(xCm + dx, yCm - dy, 'paper')),
           outer: CIRCLE_OUTER_ANGLES.map((a) => makeSample(
-            xCm + CIRCLE_OUTER_RADIUS * Math.cos(a * DEG), yCm - CIRCLE_OUTER_RADIUS * Math.sin(a * DEG)))
+            xCm + CIRCLE_OUTER_RADIUS * Math.cos(a * DEG), yCm - CIRCLE_OUTER_RADIUS * Math.sin(a * DEG), 'paper'))
         });
       }
       return circleSampleCache.get(key);
@@ -456,7 +486,7 @@
     const SLIDER_STEP_CM = 0.25;
     const sliderSamples = [];
     for (let y = SLIDER_CM.topY; y <= SLIDER_CM.bottomY + 0.001; y += SLIDER_STEP_CM) {
-      sliderSamples.push(makeSample(SLIDER_READ_X_CM, y));
+      sliderSamples.push(makeSample(SLIDER_READ_X_CM, y, 'bar'));
     }
 
     function allSamples() {
@@ -469,15 +499,15 @@
       return list;
     }
 
-    // Mark points as covered when they look clearly different from their usual self
     function readSamples(samples) {
       const current = samples.map((s) => {
         const px = paperToEyePixel(s.xCm, s.yCm);
         return readColor(px.x, px.y);
       });
+      // overall brightness change (camera auto-exposure), measured on white paper points
       const ratios = [];
       samples.forEach((s, i) => {
-        if (s.base && current[i] && lum(s.base) > 10) ratios.push(lum(current[i]) / lum(s.base));
+        if (s.kind === 'paper' && s.base && current[i] && lum(s.base) > 40) ratios.push(lum(current[i]) / lum(s.base));
       });
       ratios.sort((a, b) => a - b);
       const ratio = ratios.length ? ratios[Math.floor(ratios.length / 2)] : 1;
@@ -487,48 +517,27 @@
         if (!c) { s.covered = false; return; }
         if (!s.base) { s.base = c.slice(); s.covered = false; return; }
         const expected = s.base.map(v => v * ratio);
-        const d = Math.hypot(c[0] - expected[0], c[1] - expected[1], c[2] - expected[2]);
-        s.covered = d > COVER_DISTANCE;
-        if (!s.covered) {
-          for (let k = 0; k < 3; k++) s.base[k] = s.base[k] * 0.95 + (c[k] / ratio) * 0.05;
+        if (s.kind === 'bar') {
+          s.covered = lum(c) - lum(expected) > BAR_BRIGHTER;
+        } else {
+          s.covered = Math.hypot(c[0] - expected[0], c[1] - expected[1], c[2] - expected[2]) > COVER_DISTANCE;
         }
-      });
-    }
-
-    // ---------- Debug squares (off unless SHOW_EYE_DEBUG) ----------
-    let eyeDebugGroup;
-    function buildEyeDebug(samples) {
-      if (!SHOW_EYE_DEBUG) return;
-      const size = cmToUnits(0.12);
-      samples.forEach((s) => {
-        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ color: 0x888888 }));
-        const p = cmToPage(s.xCm, s.yCm);
-        mesh.position.set(p.x, p.y, 0.004);
-        eyeDebugGroup.add(mesh);
-        s.debug = mesh;
-      });
-    }
-    function updateEyeDebug(samples) {
-      if (!SHOW_EYE_DEBUG) return;
-      samples.forEach((s) => {
-        if (s.debug) s.debug.material.color.setHex(!s.base ? 0x888888 : (s.covered ? 0xff0000 : 0x00ff00));
+        if (!s.covered) for (let k = 0; k < 3; k++) s.base[k] = s.base[k] * 0.95 + (c[k] / ratio) * 0.05;
       });
     }
 
     // ============================================================
-    // LINE DETECTION: is there a drawn line through a tree's spot?
+    // LINE DETECTION
     // ============================================================
-    // Looks at every pixel in a 5 mm disc around the spot. The paper's white is taken from the
-    // brighter pixels of that same disc, so it doesn't matter whether the line was drawn before or after opening.
     function lineAtSpot(paper) {
       const c = paperToEyePixel(paper.x, paper.y);
       const e = paperToEyePixel(paper.x + LINE_CATCH_RADIUS_CM, paper.y);
       const r = Math.hypot(e.x - c.x, e.y - c.y);
-      if (r < 2) return false;                                   // too far away to see
+      if (r < 2) return false;
       const w = eyeCanvas.width, h = eyeCanvas.height;
       const x0 = Math.floor(c.x - r), x1 = Math.ceil(c.x + r);
       const y0 = Math.floor(c.y - r), y1 = Math.ceil(c.y + r);
-      if (x0 < 0 || y0 < 0 || x1 >= w || y1 >= h) return false;   // spot is outside the camera view
+      if (x0 < 0 || y0 < 0 || x1 >= w || y1 >= h) return false;
 
       const values = [];
       for (let y = y0; y <= y1; y++) {
@@ -539,13 +548,12 @@
       }
       if (values.length < 12) return false;
       const sorted = values.slice().sort((a, b) => a - b);
-      const paperWhite = sorted[Math.floor(sorted.length * 0.8)];   // the bright 80th percentile = the paper
-      if (paperWhite < 70) return false;                          // too dark: covered by a hand, or bad light
-
+      const paperWhite = sorted[Math.floor(sorted.length * 0.8)];
+      if (paperWhite < 70) return false;
       const inkLimit = paperWhite * 0.62;
       const ink = values.filter(v => v < inkLimit).length;
       const inkFraction = ink / values.length;
-      return ink >= Math.max(3, values.length * 0.01) && inkFraction <= 0.35;   // a line, not a finger
+      return ink >= Math.max(3, values.length * 0.01) && inkFraction <= 0.35;
     }
 
     function updateLines() {
@@ -560,13 +568,13 @@
           lineStreak.set(tree.id, 0);
         }
       });
-      if (changed) buildTreeDots();
+      if (changed) { buildTreeDots(); refreshStatus(); }
     }
 
     // ============================================================
-    // FINGER LOGIC: edition circles
+    // FINGERTIP: edition circles
     // ============================================================
-    const editionHold = { index: null, start: 0, waitRelease: false };
+    const editionHold = { index: null, start: 0, reads: 0, hits: 0, waitRelease: false, lastSeen: 0 };
 
     function fingerOnCircle(c) {
       const s = circleSamples(c.x, c.y);
@@ -581,32 +589,44 @@
       let fingerIndex = null;
       circles.forEach((c, i) => { if (fingerIndex === null && fingerOnCircle(c)) fingerIndex = i; });
 
-      let progress = 0;
-      if (fingerIndex === null) {
+      if (fingerIndex !== null) editionHold.lastSeen = now;
+
+      // Nothing there for a moment: reset
+      if (fingerIndex === null && now - editionHold.lastSeen > 250) {
         editionHold.index = null;
         editionHold.waitRelease = false;
-      } else if (!editionHold.waitRelease) {
-        if (editionHold.index !== fingerIndex) { editionHold.index = fingerIndex; editionHold.start = now; }
-        progress = (now - editionHold.start) / HOLD_MS;
-        if (progress >= 1) {
-          const chosen = circles[fingerIndex].edition;
-          if (editionExpanded) { selectedEdition = chosen; editionExpanded = false; }
-          else { editionExpanded = true; }
+        paintEditionFills(null, 0);
+        return;
+      }
+      if (editionHold.waitRelease) { paintEditionFills(null, 0); return; }
+
+      // A new circle is being held
+      if (fingerIndex !== null && fingerIndex !== editionHold.index) {
+        editionHold.index = fingerIndex;
+        editionHold.start = now;
+        editionHold.reads = 0;
+        editionHold.hits = 0;
+      }
+      if (editionHold.index === null) return;
+
+      editionHold.reads++;
+      if (fingerIndex === editionHold.index) editionHold.hits++;
+      const progress = (now - editionHold.start) / HOLD_MS;
+      paintEditionFills(editionHold.index, progress);
+
+      if (progress >= 1) {
+        if (editionHold.hits / Math.max(1, editionHold.reads) >= HOLD_STEADINESS) {
+          chooseEditionCircle(circles[editionHold.index]);
           editionHold.waitRelease = true;
-          progress = 0;
-          buildEditionRow();
-          buildTreeDots();
-          refreshStatus();
+        } else {
+          editionHold.index = null;      // not steady enough (flicker): start over
         }
       }
-      paintEditionFills(editionHold.waitRelease ? null : editionHold.index, progress);
     }
 
     // ============================================================
-    // FINGER LOGIC: scale slider
+    // FINGERTIP: scale slider
     // ============================================================
-    const slider = { grabbed: false, holdY: null, holdStart: 0, lastSeen: 0 };
-
     function findFingerOnSlider() {
       const runs = [];
       let runStart = null, gap = 0;
@@ -622,50 +642,91 @@
       let finger = null;
       for (const [a, b] of runs) {
         const lengthCm = (b - a + 1) * SLIDER_STEP_CM;
-        if (lengthCm > 4.5) return null;                     // arm or hand: ignore
-        if (lengthCm >= 0.5 && lengthCm <= 3.5 && finger === null) {
+        if (lengthCm > 4.5) return null;                       // arm or hand: ignore
+        if (lengthCm >= 0.75 && lengthCm <= 3.0) {
+          if (finger !== null) return null;                    // two separate "fingers" = noise: ignore
           finger = (sliderSamples[a].yCm + sliderSamples[b].yCm) / 2;
         }
       }
       return finger;
     }
 
-    function yToScaleT(yCm) {
-      return Math.min(1, Math.max(0, (SLIDER_CM.bottomY - yCm) / SLIDER_LENGTH_CM));
-    }
-
     function updateSlider(now) {
-      const fingerY = findFingerOnSlider();
-      let progress = 0;
+      if (slider.viaScreen) return;                            // a screen drag is in charge
+      const fingerY = (now < slider.cooldownUntil) ? null : findFingerOnSlider();
+      if (fingerY !== null) slider.lastSeen = now;
 
-      if (fingerY !== null) {
-        slider.lastSeen = now;
-        if (slider.grabbed) {
-          scaleT += (yToScaleT(fingerY) - scaleT) * 0.5;
-          sliderNote = 'sliding…';
-        } else {
-          if (slider.holdY === null || Math.abs(fingerY - slider.holdY) > 0.8) { slider.holdY = fingerY; slider.holdStart = now; }
-          progress = (now - slider.holdStart) / HOLD_MS;
-          if (progress >= 1) { slider.grabbed = true; scaleT = yToScaleT(fingerY); sliderNote = 'sliding…'; }
+      if (slider.grabbed) {
+        if (fingerY !== null) {
+          if (slider.lastY === null || Math.abs(fingerY - slider.lastY) < 3.0) {   // ignore sudden jumps
+            slider.lastY = fingerY;
+            setScaleT(scaleT + (yToScaleT(fingerY) - scaleT) * 0.5);
+          }
+        } else if (now - slider.lastSeen > 600) {
+          slider.grabbed = false;                              // finger lifted: the scale stays
+          slider.lastY = null;
+          slider.cooldownUntil = now + SLIDER_COOLDOWN_MS;
+          placeTick();
         }
-      } else if (now - slider.lastSeen > 500) {
-        if (slider.grabbed) sliderNote = '';
-        slider.grabbed = false;
-        slider.holdY = null;
+        holdMarker.material.opacity = 0;
+        return;
       }
 
-      if (!slider.grabbed && slider.holdY !== null && progress > 0) {
+      // Not grabbed: is a fingertip resting steadily on one spot?
+      if (fingerY !== null && (slider.holdY === null || Math.abs(fingerY - slider.holdY) > 0.5)) {
+        slider.holdY = fingerY;
+        slider.holdStart = now;
+        slider.holdReads = 0;
+        slider.holdHits = 0;
+      }
+      if (slider.holdY !== null) {
+        slider.holdReads++;
+        if (fingerY !== null && Math.abs(fingerY - slider.holdY) <= 0.5) slider.holdHits++;
+        if (now - slider.lastSeen > 250) { slider.holdY = null; }
+      }
+
+      let progress = 0;
+      if (slider.holdY !== null) {
+        progress = (now - slider.holdStart) / HOLD_MS;
+        if (progress >= 1) {
+          if (slider.holdHits / Math.max(1, slider.holdReads) >= HOLD_STEADINESS) {
+            slider.grabbed = true;
+            slider.lastY = slider.holdY;
+            setScaleT(yToScaleT(slider.holdY));
+          }
+          slider.holdY = null;
+          progress = 0;
+        }
+      }
+
+      if (slider.holdY !== null && progress > 0) {
         const p = cmToPage(SLIDER_CM.x, slider.holdY);
         holdMarker.position.set(p.x, p.y, 0.0025);
         holdMarker.material.opacity = Math.min(progress, 1);
       } else {
         holdMarker.material.opacity = 0;
       }
+    }
 
-      placeTick();
-      if (builtScaleT === null || Math.abs(scaleT - builtScaleT) > 0.002 || builtEdition !== selectedEdition) {
-        buildTreeDots();
-      }
+    // ============================================================
+    // SCREEN TOUCH (backup) -> a point on the paper
+    // ============================================================
+    const raycaster = new THREE.Raycaster();
+    const ndc = new THREE.Vector2();
+    const inverseMatrix = new THREE.Matrix4();
+    const localRay = new THREE.Ray();
+    const paperPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const hitPoint = new THREE.Vector3();
+
+    function screenToPaperCm(clientX, clientY, renderer, camera, anchorGroup) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      ndc.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+      raycaster.setFromCamera(ndc, camera);
+      anchorGroup.updateMatrixWorld(true);
+      inverseMatrix.copy(anchorGroup.matrixWorld).invert();
+      localRay.copy(raycaster.ray).applyMatrix4(inverseMatrix);
+      if (!localRay.intersectPlane(paperPlane, hitPoint)) return null;
+      return pageToCm(hitPoint.x, hitPoint.y);
     }
 
     // ============================================================
@@ -704,22 +765,34 @@
         container: document.getElementById('ar'),
         imageTargetSrc: './targets.mind',
         uiScanning: 'no',
-        uiLoading: 'yes'
+        uiLoading: 'yes',
+        filterMinCF: TRACK_FILTER_MIN_CF,
+        filterBeta: TRACK_FILTER_BETA,
+        warmupTolerance: TRACK_WARMUP_FRAMES,
+        missTolerance: TRACK_MISS_FRAMES
       });
       const { renderer, scene, camera } = mindarThree;
-      const anchor = mindarThree.addAnchor(0);
+      const anchor = mindarThree.addAnchor(0);    // exact tracked page (used by the eye)
 
-      editionGroup  = new THREE.Group(); anchor.group.add(editionGroup);
-      treeGroup     = new THREE.Group(); anchor.group.add(treeGroup);
-      eyeDebugGroup = new THREE.Group(); anchor.group.add(eyeDebugGroup);
+      // Everything visible lives in a smoothed copy of the page, which glides towards the tracked one
+      const display = new THREE.Group();
+      display.matrixAutoUpdate = false;
+      display.visible = false;
+      scene.add(display);
+      const smoothPos = new THREE.Vector3(), smoothQuat = new THREE.Quaternion(), smoothScale = new THREE.Vector3();
+      const targetPos = new THREE.Vector3(), targetQuat = new THREE.Quaternion(), targetScale = new THREE.Vector3();
+      let smoothReady = false;
+
+      editionGroup = new THREE.Group(); display.add(editionGroup);
+      treeGroup    = new THREE.Group(); display.add(treeGroup);
 
       tickMesh = new THREE.Mesh(new THREE.PlaneGeometry(cmToUnits(0.6), cmToUnits(0.1)), new THREE.MeshBasicMaterial({ color: GREEN }));
-      anchor.group.add(tickMesh);
+      display.add(tickMesh);
       holdMarker = new THREE.Mesh(
         new THREE.PlaneGeometry(cmToUnits(0.6), cmToUnits(0.1)),
         new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0 })
       );
-      anchor.group.add(holdMarker);
+      display.add(holdMarker);
 
       if (SHOW_DEBUG_OUTLINE) {
         const tl = cmToPage(BLANK_AREA_CM.left, BLANK_AREA_CM.top);
@@ -730,45 +803,92 @@
           new THREE.Vector3(tl.x, tl.y, 0.001), new THREE.Vector3(tr.x, tr.y, 0.001),
           new THREE.Vector3(br.x, br.y, 0.001), new THREE.Vector3(bl.x, bl.y, 0.001)
         ]);
-        anchor.group.add(new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({ color: GREEN })));
+        display.add(new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({ color: GREEN })));
       }
 
       buildEditionRow();
       placeTick();
       buildTreeDots();
-
       const samples = allSamples();
-      buildEyeDebug(samples);
 
       anchor.onTargetFound = () => { mapFound = true;  refreshStatus(); };
-      anchor.onTargetLost  = () => { mapFound = false; refreshStatus(); };
+      anchor.onTargetLost  = () => { mapFound = false; smoothReady = false; refreshStatus(); };
       refreshStatus();
+
+      // ---------- Screen backup: tap editions, drag the scale ----------
+      const arEl = document.getElementById('ar');
+      arEl.addEventListener('pointerdown', (e) => {
+        if (!mapFound) return;
+        const paper = screenToPaperCm(e.clientX, e.clientY, renderer, camera, anchor.group);
+        if (!paper) return;
+        if (Math.abs(paper.x - SLIDER_CM.x) <= SLIDER_TOUCH_CM &&
+            paper.y >= SLIDER_CM.topY - 0.5 && paper.y <= SLIDER_CM.bottomY + 0.5) {
+          slider.grabbed = true; slider.viaScreen = true;
+          arEl.setPointerCapture(e.pointerId);
+          setScaleT(yToScaleT(paper.y)); refreshStatus();
+          return;
+        }
+        for (const c of visibleEditionCircles()) {
+          if (Math.hypot(paper.x - c.x, paper.y - c.y) <= EDITION_TOUCH_CM) { chooseEditionCircle(c); return; }
+        }
+      });
+      arEl.addEventListener('pointermove', (e) => {
+        if (!slider.viaScreen || !mapFound) return;
+        const paper = screenToPaperCm(e.clientX, e.clientY, renderer, camera, anchor.group);
+        if (paper) { setScaleT(yToScaleT(paper.y)); refreshStatus(); }
+      });
+      const release = () => {
+        if (slider.viaScreen) {
+          slider.viaScreen = false; slider.grabbed = false;
+          slider.cooldownUntil = performance.now() + SLIDER_COOLDOWN_MS;
+          placeTick(); refreshStatus();
+        }
+      };
+      arEl.addEventListener('pointerup', release);
+      arEl.addEventListener('pointercancel', release);
 
       await mindarThree.start();
       const video = mindarThree.video;
 
       let lastEye = 0;
       renderer.setAnimationLoop(() => {
+        // Glide the visible page towards the tracked page
+        if (mapFound) {
+          anchor.group.updateMatrixWorld(true);
+          anchor.group.matrixWorld.decompose(targetPos, targetQuat, targetScale);
+          if (!smoothReady) {
+            smoothPos.copy(targetPos); smoothQuat.copy(targetQuat); smoothScale.copy(targetScale);
+            smoothReady = true;
+          } else {
+            smoothPos.lerp(targetPos, DISPLAY_SMOOTHING);
+            smoothQuat.slerp(targetQuat, DISPLAY_SMOOTHING);
+            smoothScale.lerp(targetScale, DISPLAY_SMOOTHING);
+          }
+          display.matrix.compose(smoothPos, smoothQuat, smoothScale);
+          display.matrixWorldNeedsUpdate = true;
+          display.visible = true;
+        } else {
+          display.visible = false;
+        }
+
         renderer.render(scene, camera);
 
+        // Read the paper ten times a second
         const now = performance.now();
         if (!mapFound || now - lastEye < EYE_TICK_MS) return;
         lastEye = now;
         if (!captureFrame(video)) return;
 
-        anchor.group.updateMatrixWorld(true);
         view = {
           anchorGroup: anchor.group,
           camera,
           canvasRect: renderer.domElement.getBoundingClientRect(),
           videoRect: video.getBoundingClientRect()
         };
-
         readSamples(samples);
-        updateEyeDebug(samples);
         updateEditions(now);
         updateSlider(now);
-        updateLines();
+        if (selectedEdition !== null) updateLines();
         refreshStatus();
       });
     }
