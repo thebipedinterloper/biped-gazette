@@ -29,7 +29,7 @@
     #status {
       position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5;
       background: rgba(255,255,255,0.9); color: #000; padding: 6px 12px; border-radius: 4px;
-      font-size: 14px; display: none;
+      font-size: 13px; display: none; max-width: 90%; text-align: center;
     }
   </style>
 </head>
@@ -44,19 +44,47 @@
   <script type="module">
     import * as THREE from 'three';
     import { MindARThree } from 'mindar-image-three';
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+    import { getFirestore, collection, getDocs } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
-    // ------------------------------------------------------------
-    // PAPER SETTINGS (from InDesign, in cm, measured from the page's top-left corner)
-    // ------------------------------------------------------------
-    const PAGE_WIDTH_CM  = 21.0;   // A4 portrait width
-    const PAGE_HEIGHT_CM = 29.7;   // A4 portrait height
-
-    const BLANK_AREA_CM = {
-      left:   3.24,
-      top:    3.11,
-      right: 17.74,
-      bottom: 26.61
+    // ============================================================
+    // FIREBASE (your web app config)
+    // ============================================================
+    const firebaseConfig = {
+      apiKey: "AIzaSyA7T_RzFr779vvo4TWR4fNrtA20D-CAo98",
+      authDomain: "arvore-56897.firebaseapp.com",
+      projectId: "arvore-56897",
+      storageBucket: "arvore-56897.firebasestorage.app",
+      messagingSenderId: "20525579847",
+      appId: "1:20525579847:web:9e8ac502d16b1ed4ddfb62"
     };
+    const firebaseApp = initializeApp(firebaseConfig);
+    const db = getFirestore(firebaseApp);
+
+    // ============================================================
+    // PAPER LAYOUT (from InDesign, in cm, measured from the page's top-left corner)
+    // ============================================================
+    const PAGE_WIDTH_CM  = 21.0;   // A4 portrait
+    const PAGE_HEIGHT_CM = 29.7;
+
+    // The blank drawing area (inner edge of the thick bar)
+    const BLANK_AREA_CM = { left: 3.24, top: 3.11, right: 17.74, bottom: 26.61 };
+
+    // The scale slider: the thin white line in the LEFT side of the thick bar
+    // bottom = closest scale (default), top = whole world
+    const SLIDER_CM = { x: 3.00, bottomY: 26.87, topY: 2.80 };
+
+    // The edition circles: one row under the word EDITION
+    const EDITION_ROW_CM = { centerX: 10.5, centerY: 29.15 };
+    const EDITION_CIRCLE_CM = 0.8;      // 8 mm across
+    const EDITION_GAP_CM    = 0.4;      // space between circles
+    const EDITION_LINE_CM   = 0.07;     // about 2 pt
+
+    // Show the blank-area outline (for checking alignment; turn off later)
+    const SHOW_DEBUG_OUTLINE = true;
+
+    const GREEN = 0x00ff00;
+    const BLACK = 0x000000;
 
     // MindAR measures the page in "page widths": the page is 1 unit wide,
     // its centre is (0, 0), x goes right, y goes up.
@@ -66,13 +94,132 @@
         y: (PAGE_HEIGHT_CM / 2 - yCm) / PAGE_WIDTH_CM
       };
     }
+    function cmToUnits(cm) { return cm / PAGE_WIDTH_CM; }
 
-    const GREEN = 0x00ff00;
     const statusEl = document.getElementById('status');
+    function setStatus(text) { statusEl.textContent = text; }
 
+    // ============================================================
+    // DATA: curated trees from Firestore
+    // ============================================================
+    let trees = [];        // { id, title, latitude, longitude, edition, data }
+    let editions = [];     // sorted list of edition numbers, e.g. [0, 1, 2]
+
+    async function loadTrees() {
+      const snapshot = await getDocs(collection(db, 'curatedTree'));
+      const list = [];
+      snapshot.forEach((doc) => {
+        const d = doc.data();
+        const edition = Number(d.edition);            // accepts number or text "0"
+        if (d.edition === undefined || d.edition === null || Number.isNaN(edition)) return;  // trees without an edition are skipped
+        list.push({
+          id: doc.id,
+          title: doc.id,                               // document name = tree title
+          latitude: Number(d.latitude),
+          longitude: Number(d.longitude),
+          edition: edition,
+          data: d
+        });
+      });
+      trees = list;
+      editions = [...new Set(list.map(t => t.edition))].sort((a, b) => a - b);
+    }
+
+    // Start loading straight away (while the reader is still on the start screen)
+    const treesReady = loadTrees().catch((err) => {
+      console.error(err);
+      return Promise.reject(err);
+    });
+
+    // ============================================================
+    // DRAWING HELPERS
+    // ============================================================
+
+    // A circled number, drawn on a little canvas and used as a texture
+    function makeEditionCircle(number, colorCss) {
+      const px = 256;
+      const canvas = document.createElement('canvas');
+      canvas.width = px; canvas.height = px;
+      const g = canvas.getContext('2d');
+      const lineWidth = px * (EDITION_LINE_CM / EDITION_CIRCLE_CM);
+      g.clearRect(0, 0, px, px);
+      g.strokeStyle = colorCss;
+      g.lineWidth = lineWidth;
+      g.beginPath();
+      g.arc(px / 2, px / 2, px / 2 - lineWidth / 2 - 2, 0, Math.PI * 2);
+      g.stroke();
+      g.fillStyle = colorCss;
+      g.font = 'bold 130px Georgia, serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText(String(number), px / 2, px / 2 + 8);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      const size = cmToUnits(EDITION_CIRCLE_CM);
+      const mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(size, size),
+        new THREE.MeshBasicMaterial({ map: texture, transparent: true })
+      );
+      return mesh;
+    }
+
+    // The row of edition circles, centred under EDITION
+    function buildEditionRow(group) {
+      const pitch = EDITION_CIRCLE_CM + EDITION_GAP_CM;
+      const rowWidth = editions.length * EDITION_CIRCLE_CM + (editions.length - 1) * EDITION_GAP_CM;
+      const firstCenterX = EDITION_ROW_CM.centerX - rowWidth / 2 + EDITION_CIRCLE_CM / 2;
+      editions.forEach((ed, i) => {
+        const circle = makeEditionCircle(ed, '#000000');
+        const p = cmToPage(firstCenterX + i * pitch, EDITION_ROW_CM.centerY);
+        circle.position.set(p.x, p.y, 0.002);
+        group.add(circle);
+      });
+    }
+
+    // The scale tick: a small horizontal green mark on the left white line
+    function buildScaleTick(group) {
+      const tick = new THREE.Mesh(
+        new THREE.PlaneGeometry(cmToUnits(0.6), cmToUnits(0.1)),
+        new THREE.MeshBasicMaterial({ color: GREEN })
+      );
+      const p = cmToPage(SLIDER_CM.x, SLIDER_CM.bottomY);   // default = closest scale (bottom)
+      tick.position.set(p.x, p.y, 0.002);
+      group.add(tick);
+      return tick;
+    }
+
+    // Thin outline of the blank area (debug)
+    function buildDebugOutline(group) {
+      const tl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.top);
+      const tr = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.top);
+      const br = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.bottom);
+      const bl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.bottom);
+      const geometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(tl.x, tl.y, 0.001),
+        new THREE.Vector3(tr.x, tr.y, 0.001),
+        new THREE.Vector3(br.x, br.y, 0.001),
+        new THREE.Vector3(bl.x, bl.y, 0.001)
+      ]);
+      group.add(new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({ color: GREEN })));
+    }
+
+    // ============================================================
+    // START
+    // ============================================================
     async function startAR() {
       document.getElementById('start').style.display = 'none';
       statusEl.style.display = 'block';
+      setStatus('Loading the archive…');
+
+      // Wait for Firestore
+      let dataMessage = '';
+      try {
+        await treesReady;
+        dataMessage = trees.length + ' trees · editions: ' + (editions.length ? editions.join(', ') : 'none');
+      } catch (err) {
+        dataMessage = 'Could not read the archive: ' + err.message;
+      }
 
       const mindarThree = new MindARThree({
         container: document.getElementById('ar'),
@@ -80,38 +227,18 @@
         uiScanning: 'no',
         uiLoading: 'yes'
       });
-
       const { renderer, scene, camera } = mindarThree;
 
-      // Anchor 0 = the first (and only) image in targets.mind: the Biped Gazette frame
+      // Anchor 0 = the Biped Gazette frame
       const anchor = mindarThree.addAnchor(0);
 
-      // 1) Small green square at the centre of the page (2 cm wide)
-      const squareSize = 2 / PAGE_WIDTH_CM;
-      const square = new THREE.Mesh(
-        new THREE.PlaneGeometry(squareSize, squareSize),
-        new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.7 })
-      );
-      anchor.group.add(square);
+      buildEditionRow(anchor.group);
+      buildScaleTick(anchor.group);
+      if (SHOW_DEBUG_OUTLINE) buildDebugOutline(anchor.group);
 
-      // 2) Thin green outline of the blank area, from the four InDesign corners
-      const tl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.top);
-      const tr = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.top);
-      const br = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.bottom);
-      const bl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.bottom);
-
-      const outlineGeometry = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(tl.x, tl.y, 0.001),
-        new THREE.Vector3(tr.x, tr.y, 0.001),
-        new THREE.Vector3(br.x, br.y, 0.001),
-        new THREE.Vector3(bl.x, bl.y, 0.001)
-      ]);
-      const outline = new THREE.LineLoop(outlineGeometry, new THREE.LineBasicMaterial({ color: GREEN }));
-      anchor.group.add(outline);
-
-      // Status messages
-      anchor.onTargetFound = () => { statusEl.textContent = 'Map found'; };
-      anchor.onTargetLost  = () => { statusEl.textContent = 'Looking for the map…'; };
+      setStatus('Looking for the map… · ' + dataMessage);
+      anchor.onTargetFound = () => { setStatus('Map found · ' + dataMessage); };
+      anchor.onTargetLost  = () => { setStatus('Looking for the map… · ' + dataMessage); };
 
       await mindarThree.start();
       renderer.setAnimationLoop(() => {
