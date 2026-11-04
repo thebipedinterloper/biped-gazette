@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>The Biped Gazette</title>
 
-  <!-- Where the libraries come from (loaded from the internet) -->
   <script type="importmap">
   {
     "imports": {
@@ -29,7 +28,7 @@
     #status {
       position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5;
       background: rgba(255,255,255,0.9); color: #000; padding: 6px 12px; border-radius: 4px;
-      font-size: 13px; display: none; max-width: 90%; text-align: center;
+      font-size: 12px; line-height: 1.4; display: none; max-width: 92%; text-align: center;
     }
   </style>
 </head>
@@ -46,6 +45,18 @@
     import { MindARThree } from 'mindar-image-three';
     import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
     import { getFirestore, collection, getDocs } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+    // ============================================================
+    // TEST SWITCHES
+    // ============================================================
+    // Where the map is centred:
+    //   'gps'           = the reader's position (Point Nemo if location fails)
+    //   'nearFirstTree' = desk test: 20 m south and 10 m west of the first tree in Firestore
+    const CENTER_MODE = 'gps';
+
+    const SHOW_DEBUG_OUTLINE = false;  // green outline of the blank area
+    const SHOW_EYE_DEBUG     = false;  // little squares where the camera reads the paper
+    const SHOW_STATUS        = true;   // the information line at the top of the screen
 
     // ============================================================
     // FIREBASE (your web app config)
@@ -69,25 +80,36 @@
 
     // The blank drawing area (inner edge of the thick bar)
     const BLANK_AREA_CM = { left: 3.24, top: 3.11, right: 17.74, bottom: 26.61 };
+    const BLANK_CENTER_CM = {
+      x: (BLANK_AREA_CM.left + BLANK_AREA_CM.right) / 2,
+      y: (BLANK_AREA_CM.top + BLANK_AREA_CM.bottom) / 2
+    };
+    const BLANK_WIDTH_CM = BLANK_AREA_CM.right - BLANK_AREA_CM.left;     // 14.5 cm
 
     // The scale slider: the thin white line in the LEFT side of the thick bar
-    // bottom = closest scale (default), top = whole world
-    const SLIDER_CM = { x: 3.00, bottomY: 26.87, topY: 2.80 };
+    const SLIDER_CM = { x: 3.00, bottomY: 26.87, topY: 2.80 };           // bottom = closest, top = world
+    const SLIDER_LENGTH_CM = SLIDER_CM.bottomY - SLIDER_CM.topY;         // 24.07 cm
+    const SLIDER_READ_X_CM = 2.75;     // the eye reads the black stretch just left of the white line
 
     // The edition circles: one row under the word EDITION
     const EDITION_ROW_CM = { centerX: 10.5, centerY: 29.15 };
-    const EDITION_CIRCLE_CM = 0.8;      // 8 mm across
-    const EDITION_GAP_CM    = 0.4;      // space between circles
-    const EDITION_LINE_CM   = 0.07;     // about 2 pt
+    const EDITION_CIRCLE_CM = 1.0;     // 1 cm across
+    const EDITION_GAP_CM    = 0.4;
+    const EDITION_LINE_CM   = 0.035;   // about 1 pt
 
-    // Show the blank-area outline (for checking alignment; turn off later)
-    const SHOW_DEBUG_OUTLINE = true;
+    // Tree dots and line detection
+    const DOT_DIAMETER_CM       = 0.3;   // 3 mm, always the same on paper
+    const LINE_CATCH_RADIUS_CM  = 0.5;   // a line counts if it passes within 5 mm of the tree's spot
+    const LINE_CONFIRM_TICKS    = 5;     // the mark must be seen 5 times in a row (half a second)
+
+    // The eye
+    const EYE_TICK_MS     = 100;       // how often the paper is read
+    const EYE_WIDTH_PX    = 960;       // resolution the camera image is read at
+    const COVER_DISTANCE  = 45;        // how different a point must look to count as "covered"
+    const HOLD_MS         = 2000;      // fingertip hold time
 
     const GREEN = 0x00ff00;
-    const BLACK = 0x000000;
 
-    // MindAR measures the page in "page widths": the page is 1 unit wide,
-    // its centre is (0, 0), x goes right, y goes up.
     function cmToPage(xCm, yCm) {
       return {
         x: (xCm - PAGE_WIDTH_CM / 2) / PAGE_WIDTH_CM,
@@ -96,112 +118,554 @@
     }
     function cmToUnits(cm) { return cm / PAGE_WIDTH_CM; }
 
-    const statusEl = document.getElementById('status');
-    function setStatus(text) { statusEl.textContent = text; }
+    // ============================================================
+    // MAP: Equal Earth projection, centred on the reader, north up
+    // ============================================================
+    const EARTH_RADIUS_M = 6371008.8;
+    const DEG = Math.PI / 180;
+    const POINT_NEMO = { lat: -48.8767, lon: -123.3933 };
+
+    const EE_A1 = 1.340264, EE_A2 = -0.081106, EE_A3 = 0.000893, EE_A4 = 0.003796;
+    const EE_M = Math.sqrt(3) / 2;
+
+    function equalEarth(lambda, phi) {
+      const t = Math.asin(EE_M * Math.sin(phi));
+      const t2 = t * t, t6 = t2 * t2 * t2;
+      const x = (2 * Math.sqrt(3) * lambda * Math.cos(t)) /
+                (3 * (9 * EE_A4 * t6 * t2 + 7 * EE_A3 * t6 + 3 * EE_A2 * t2 + EE_A1));
+      const y = t * (EE_A1 + EE_A2 * t2 + t6 * (EE_A3 + EE_A4 * t2));
+      return { x, y };
+    }
+    function wrapLongitude(deg) { return ((deg + 540) % 360) - 180; }
+
+    const METERS_PER_CM_CLOSEST = 100 / SLIDER_LENGTH_CM;
+    const WORLD_WIDTH_M = 2 * equalEarth(Math.PI, 0).x * EARTH_RADIUS_M;
+    const METERS_PER_CM_WORLD = WORLD_WIDTH_M / BLANK_WIDTH_CM;
+
+    let scaleT = 0;   // 0 = closest (bottom of the line), 1 = whole world (top)
+    function metersPerCm() {
+      return METERS_PER_CM_CLOSEST * Math.pow(METERS_PER_CM_WORLD / METERS_PER_CM_CLOSEST, scaleT);
+    }
+
+    let center = { lat: POINT_NEMO.lat, lon: POINT_NEMO.lon, source: 'Point Nemo' };
+
+    function geoToPaperCm(lat, lon) {
+      const centerY = equalEarth(0, center.lat * DEG).y;
+      const p = equalEarth(wrapLongitude(lon - center.lon) * DEG, lat * DEG);
+      const mpc = metersPerCm();
+      return {
+        x: BLANK_CENTER_CM.x + (p.x * EARTH_RADIUS_M) / mpc,
+        y: BLANK_CENTER_CM.y - ((p.y - centerY) * EARTH_RADIUS_M) / mpc
+      };
+    }
+    function isInsideBlankArea(p) {
+      return p.x >= BLANK_AREA_CM.left && p.x <= BLANK_AREA_CM.right &&
+             p.y >= BLANK_AREA_CM.top  && p.y <= BLANK_AREA_CM.bottom;
+    }
+    function scaleLabel() {
+      const meters = metersPerCm() * SLIDER_LENGTH_CM;
+      return meters < 1000 ? 'line = ' + Math.round(meters) + ' m'
+                           : 'line = ' + Math.round(meters / 1000).toLocaleString() + ' km';
+    }
 
     // ============================================================
     // DATA: curated trees from Firestore
     // ============================================================
-    let trees = [];        // { id, title, latitude, longitude, edition, data }
-    let editions = [];     // sorted list of edition numbers, e.g. [0, 1, 2]
+    let trees = [];
+    let editions = [];
+    let selectedEdition = null;
+    const foundTrees = new Set();        // tree ids found by a line in this session
+    const lineStreak = new Map();        // tree id -> how many reads in a row a line was seen
 
     async function loadTrees() {
       const snapshot = await getDocs(collection(db, 'curatedTree'));
       const list = [];
       snapshot.forEach((doc) => {
         const d = doc.data();
-        const edition = Number(d.edition);            // accepts number or text "0"
-        if (d.edition === undefined || d.edition === null || Number.isNaN(edition)) return;  // trees without an edition are skipped
-        list.push({
-          id: doc.id,
-          title: doc.id,                               // document name = tree title
-          latitude: Number(d.latitude),
-          longitude: Number(d.longitude),
-          edition: edition,
-          data: d
-        });
+        if (d.edition === undefined || d.edition === null) return;
+        const edition = Number(d.edition);
+        if (Number.isNaN(edition)) return;
+        list.push({ id: doc.id, title: doc.id, latitude: Number(d.latitude), longitude: Number(d.longitude), edition, data: d });
       });
       trees = list;
       editions = [...new Set(list.map(t => t.edition))].sort((a, b) => a - b);
     }
+    const treesReady = loadTrees();
 
-    // Start loading straight away (while the reader is still on the start screen)
-    const treesReady = loadTrees().catch((err) => {
-      console.error(err);
-      return Promise.reject(err);
-    });
+    // Trees of the chosen edition that fall inside the blank area, with their paper position
+    function treesOnPage() {
+      if (selectedEdition === null) return [];
+      return trees
+        .filter(t => t.edition === selectedEdition)
+        .map(t => ({ tree: t, paper: geoToPaperCm(t.latitude, t.longitude) }))
+        .filter(o => isInsideBlankArea(o.paper));
+    }
+
+    // ============================================================
+    // STATUS LINE
+    // ============================================================
+    const statusEl = document.getElementById('status');
+    let mapFound = false;
+    let dataProblem = '';
+    let sliderNote = '';
+
+    function refreshStatus() {
+      if (!SHOW_STATUS) { statusEl.style.display = 'none'; return; }
+      let text = mapFound ? 'Map found' : 'Looking for the map…';
+      if (dataProblem) {
+        text += ' · ' + dataProblem;
+      } else if (selectedEdition === null) {
+        text += ' · Choose an edition: hold a finger on a number for 2 s';
+      } else {
+        const onPage = treesOnPage();
+        const foundOnPage = onPage.filter(o => foundTrees.has(o.tree.id)).length;
+        text += ' · Edition ' + selectedEdition + ' · ' + onPage.length + ' on the page, ' + foundOnPage + ' found · ' +
+                scaleLabel() + ' · centre: ' + center.source;
+      }
+      if (sliderNote) text += ' · ' + sliderNote;
+      statusEl.textContent = text;
+    }
+
+    // ============================================================
+    // LOCATION
+    // ============================================================
+    function getGpsPosition() {
+      return new Promise((resolve) => {
+        if (!navigator.geolocation) { resolve(null); return; }
+        navigator.geolocation.getCurrentPosition(
+          (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy }),
+          () => resolve(null),
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+      });
+    }
 
     // ============================================================
     // DRAWING HELPERS
     // ============================================================
+    function hashString(text) {
+      let h = 2166136261;
+      for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+      return h >>> 0;
+    }
+    function seededRandom(seed) {
+      let s = seed || 1;
+      return () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return ((s >>> 0) % 100000) / 100000; };
+    }
 
-    // A circled number, drawn on a little canvas and used as a texture
-    function makeEditionCircle(number, colorCss) {
+    // An irregular round green blob, 3 mm across, its shape seeded by the tree
+    function makeBlob(seedText) {
+      const random = seededRandom(hashString(seedText));
+      const pointCount = 9;
+      const radius = cmToUnits(DOT_DIAMETER_CM) / 2;
+      const points = [];
+      for (let i = 0; i < pointCount; i++) {
+        const angle = (i / pointCount) * Math.PI * 2 + (random() - 0.5) * 0.45;
+        const r = radius * (0.78 + random() * 0.4);
+        points.push(new THREE.Vector2(Math.cos(angle) * r, Math.sin(angle) * r));
+      }
+      const mid = (a, b) => new THREE.Vector2((a.x + b.x) / 2, (a.y + b.y) / 2);
+      const shape = new THREE.Shape();
+      const start = mid(points[pointCount - 1], points[0]);
+      shape.moveTo(start.x, start.y);
+      for (let i = 0; i < pointCount; i++) {
+        const p = points[i];
+        const m = mid(p, points[(i + 1) % pointCount]);
+        shape.quadraticCurveTo(p.x, p.y, m.x, m.y);
+      }
+      return new THREE.Mesh(new THREE.ShapeGeometry(shape, 12), new THREE.MeshBasicMaterial({ color: GREEN }));
+    }
+
+    // A circled number: black stroke, black number (texture on a small square)
+    function makeEditionCircle(number) {
       const px = 256;
       const canvas = document.createElement('canvas');
       canvas.width = px; canvas.height = px;
       const g = canvas.getContext('2d');
-      const lineWidth = px * (EDITION_LINE_CM / EDITION_CIRCLE_CM);
-      g.clearRect(0, 0, px, px);
-      g.strokeStyle = colorCss;
+      const lineWidth = Math.max(2, px * (EDITION_LINE_CM / EDITION_CIRCLE_CM));
+      g.strokeStyle = '#000000';
       g.lineWidth = lineWidth;
       g.beginPath();
       g.arc(px / 2, px / 2, px / 2 - lineWidth / 2 - 2, 0, Math.PI * 2);
       g.stroke();
-      g.fillStyle = colorCss;
-      g.font = 'bold 130px Georgia, serif';
+      g.fillStyle = '#000000';
+      g.font = '120px Georgia, serif';
       g.textAlign = 'center';
       g.textBaseline = 'middle';
       g.fillText(String(number), px / 2, px / 2 + 8);
-
       const texture = new THREE.CanvasTexture(canvas);
       texture.colorSpace = THREE.SRGBColorSpace;
       const size = cmToUnits(EDITION_CIRCLE_CM);
-      const mesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(size, size),
-        new THREE.MeshBasicMaterial({ map: texture, transparent: true })
-      );
-      return mesh;
+      return new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ map: texture, transparent: true }));
     }
 
-    // The row of edition circles, centred under EDITION
-    function buildEditionRow(group) {
+    function clearGroup(group) {
+      while (group.children.length) {
+        const child = group.children.pop();
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (child.material.map) child.material.map.dispose();
+          child.material.dispose();
+        }
+      }
+    }
+
+    // ============================================================
+    // EDITION CIRCLES
+    // ============================================================
+    let editionExpanded = true;     // true = all numbers shown; false = only the chosen one
+
+    function editionListPositions() {
       const pitch = EDITION_CIRCLE_CM + EDITION_GAP_CM;
-      const rowWidth = editions.length * EDITION_CIRCLE_CM + (editions.length - 1) * EDITION_GAP_CM;
-      const firstCenterX = EDITION_ROW_CM.centerX - rowWidth / 2 + EDITION_CIRCLE_CM / 2;
-      editions.forEach((ed, i) => {
-        const circle = makeEditionCircle(ed, '#000000');
-        const p = cmToPage(firstCenterX + i * pitch, EDITION_ROW_CM.centerY);
+      const rowWidth = editions.length * EDITION_CIRCLE_CM + Math.max(0, editions.length - 1) * EDITION_GAP_CM;
+      const firstX = EDITION_ROW_CM.centerX - rowWidth / 2 + EDITION_CIRCLE_CM / 2;
+      return editions.map((ed, i) => ({ edition: ed, x: firstX + i * pitch, y: EDITION_ROW_CM.centerY }));
+    }
+    function visibleEditionCircles() {
+      if (editionExpanded || selectedEdition === null) return editionListPositions();
+      return [{ edition: selectedEdition, x: EDITION_ROW_CM.centerX, y: EDITION_ROW_CM.centerY }];
+    }
+
+    let editionGroup, editionFills = [];
+    function buildEditionRow() {
+      clearGroup(editionGroup);
+      editionFills = [];
+      visibleEditionCircles().forEach((c) => {
+        const p = cmToPage(c.x, c.y);
+        // Green fill: full when this edition is the chosen one, growing while a finger holds it
+        const fill = new THREE.Mesh(
+          new THREE.CircleGeometry(cmToUnits(EDITION_CIRCLE_CM) / 2 * 0.97, 40),
+          new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0 })
+        );
+        fill.position.set(p.x, p.y, 0.0015);
+        editionGroup.add(fill);
+        editionFills.push({ mesh: fill, edition: c.edition });
+
+        const circle = makeEditionCircle(c.edition);
         circle.position.set(p.x, p.y, 0.002);
-        group.add(circle);
+        editionGroup.add(circle);
+      });
+      paintEditionFills(null, 0);
+    }
+    function paintEditionFills(holdIndex, progress) {
+      editionFills.forEach((f, i) => {
+        let opacity = (f.edition === selectedEdition) ? 1 : 0;
+        if (i === holdIndex && f.edition !== selectedEdition) opacity = Math.min(progress, 1);
+        f.mesh.material.opacity = opacity;
       });
     }
 
-    // The scale tick: a small horizontal green mark on the left white line
-    function buildScaleTick(group) {
-      const tick = new THREE.Mesh(
-        new THREE.PlaneGeometry(cmToUnits(0.6), cmToUnits(0.1)),
-        new THREE.MeshBasicMaterial({ color: GREEN })
-      );
-      const p = cmToPage(SLIDER_CM.x, SLIDER_CM.bottomY);   // default = closest scale (bottom)
-      tick.position.set(p.x, p.y, 0.002);
-      group.add(tick);
-      return tick;
+    // ============================================================
+    // SCALE TICK and TREE DOTS
+    // ============================================================
+    let tickMesh, holdMarker, treeGroup;
+    let builtScaleT = null, builtEdition = undefined, builtFoundCount = -1;
+
+    function placeTick() {
+      const yCm = SLIDER_CM.bottomY + (SLIDER_CM.topY - SLIDER_CM.bottomY) * scaleT;
+      const p = cmToPage(SLIDER_CM.x, yCm);
+      tickMesh.position.set(p.x, p.y, 0.002);
+      tickMesh.scale.set(1, slider.grabbed ? 2.2 : 1, 1);
     }
 
-    // Thin outline of the blank area (debug)
-    function buildDebugOutline(group) {
-      const tl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.top);
-      const tr = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.top);
-      const br = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.bottom);
-      const bl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.bottom);
-      const geometry = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(tl.x, tl.y, 0.001),
-        new THREE.Vector3(tr.x, tr.y, 0.001),
-        new THREE.Vector3(br.x, br.y, 0.001),
-        new THREE.Vector3(bl.x, bl.y, 0.001)
-      ]);
-      group.add(new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({ color: GREEN })));
+    // Only trees that have been found by a line are drawn
+    function buildTreeDots() {
+      clearGroup(treeGroup);
+      treesOnPage().forEach(({ tree, paper }) => {
+        if (!foundTrees.has(tree.id)) return;
+        const blob = makeBlob(tree.id);
+        const p = cmToPage(paper.x, paper.y);
+        blob.position.set(p.x, p.y, 0.003);
+        treeGroup.add(blob);
+      });
+      builtScaleT = scaleT;
+      builtEdition = selectedEdition;
+      builtFoundCount = foundTrees.size;
+    }
+
+    // ============================================================
+    // THE EYE: reading the camera image
+    // ============================================================
+    const eyeCanvas = document.createElement('canvas');
+    const eyeCtx = eyeCanvas.getContext('2d', { willReadFrequently: true });
+    let eyePixels = null;
+    const tmpVec = new THREE.Vector3();
+    let view = null;     // { anchorGroup, camera, canvasRect, videoRect } for this read
+
+    function captureFrame(video) {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return false;
+      const w = Math.min(EYE_WIDTH_PX, vw);
+      const h = Math.round(vh * (w / vw));
+      if (eyeCanvas.width !== w || eyeCanvas.height !== h) { eyeCanvas.width = w; eyeCanvas.height = h; }
+      eyeCtx.drawImage(video, 0, 0, w, h);
+      eyePixels = eyeCtx.getImageData(0, 0, w, h).data;
+      return true;
+    }
+
+    // A point on the paper (cm) -> a pixel in the captured frame
+    function paperToEyePixel(xCm, yCm) {
+      const p = cmToPage(xCm, yCm);
+      tmpVec.set(p.x, p.y, 0).applyMatrix4(view.anchorGroup.matrixWorld).project(view.camera);
+      const sx = view.canvasRect.left + (tmpVec.x + 1) / 2 * view.canvasRect.width;
+      const sy = view.canvasRect.top + (1 - tmpVec.y) / 2 * view.canvasRect.height;
+      return {
+        x: (sx - view.videoRect.left) / view.videoRect.width * eyeCanvas.width,
+        y: (sy - view.videoRect.top) / view.videoRect.height * eyeCanvas.height
+      };
+    }
+
+    function pixelLum(x, y) {
+      const i = (y * eyeCanvas.width + x) * 4;
+      return 0.299 * eyePixels[i] + 0.587 * eyePixels[i + 1] + 0.114 * eyePixels[i + 2];
+    }
+    function readColor(px, py) {
+      px = Math.round(px); py = Math.round(py);
+      const w = eyeCanvas.width, h = eyeCanvas.height;
+      if (px < 1 || py < 1 || px >= w - 1 || py >= h - 1) return null;
+      let r = 0, g = 0, b = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const i = ((py + dy) * w + (px + dx)) * 4;
+          r += eyePixels[i]; g += eyePixels[i + 1]; b += eyePixels[i + 2];
+        }
+      }
+      return [r / 9, g / 9, b / 9];
+    }
+    const lum = (c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+
+    // ---------- Reading points for the edition circles and the slider ----------
+    function makeSample(xCm, yCm) { return { xCm, yCm, base: null, covered: false, debug: null }; }
+
+    const CIRCLE_INNER = [[0,0],[0.22,0],[-0.22,0],[0,0.22],[0,-0.22],[0.16,0.16],[-0.16,0.16],[0.16,-0.16],[-0.16,-0.16]];
+    const CIRCLE_OUTER_RADIUS = 0.95;
+    const CIRCLE_OUTER_ANGLES = [0, 45, 90, 135, 180];
+    const circleSampleCache = new Map();
+    function circleSamples(xCm, yCm) {
+      const key = xCm.toFixed(2) + ',' + yCm.toFixed(2);
+      if (!circleSampleCache.has(key)) {
+        circleSampleCache.set(key, {
+          inner: CIRCLE_INNER.map(([dx, dy]) => makeSample(xCm + dx, yCm - dy)),
+          outer: CIRCLE_OUTER_ANGLES.map((a) => makeSample(
+            xCm + CIRCLE_OUTER_RADIUS * Math.cos(a * DEG), yCm - CIRCLE_OUTER_RADIUS * Math.sin(a * DEG)))
+        });
+      }
+      return circleSampleCache.get(key);
+    }
+
+    const SLIDER_STEP_CM = 0.25;
+    const sliderSamples = [];
+    for (let y = SLIDER_CM.topY; y <= SLIDER_CM.bottomY + 0.001; y += SLIDER_STEP_CM) {
+      sliderSamples.push(makeSample(SLIDER_READ_X_CM, y));
+    }
+
+    function allSamples() {
+      const list = [...sliderSamples];
+      const positions = editionListPositions().concat([{ x: EDITION_ROW_CM.centerX, y: EDITION_ROW_CM.centerY }]);
+      positions.forEach((pos) => {
+        const s = circleSamples(pos.x, pos.y);
+        list.push(...s.inner, ...s.outer);
+      });
+      return list;
+    }
+
+    // Mark points as covered when they look clearly different from their usual self
+    function readSamples(samples) {
+      const current = samples.map((s) => {
+        const px = paperToEyePixel(s.xCm, s.yCm);
+        return readColor(px.x, px.y);
+      });
+      const ratios = [];
+      samples.forEach((s, i) => {
+        if (s.base && current[i] && lum(s.base) > 10) ratios.push(lum(current[i]) / lum(s.base));
+      });
+      ratios.sort((a, b) => a - b);
+      const ratio = ratios.length ? ratios[Math.floor(ratios.length / 2)] : 1;
+
+      samples.forEach((s, i) => {
+        const c = current[i];
+        if (!c) { s.covered = false; return; }
+        if (!s.base) { s.base = c.slice(); s.covered = false; return; }
+        const expected = s.base.map(v => v * ratio);
+        const d = Math.hypot(c[0] - expected[0], c[1] - expected[1], c[2] - expected[2]);
+        s.covered = d > COVER_DISTANCE;
+        if (!s.covered) {
+          for (let k = 0; k < 3; k++) s.base[k] = s.base[k] * 0.95 + (c[k] / ratio) * 0.05;
+        }
+      });
+    }
+
+    // ---------- Debug squares (off unless SHOW_EYE_DEBUG) ----------
+    let eyeDebugGroup;
+    function buildEyeDebug(samples) {
+      if (!SHOW_EYE_DEBUG) return;
+      const size = cmToUnits(0.12);
+      samples.forEach((s) => {
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ color: 0x888888 }));
+        const p = cmToPage(s.xCm, s.yCm);
+        mesh.position.set(p.x, p.y, 0.004);
+        eyeDebugGroup.add(mesh);
+        s.debug = mesh;
+      });
+    }
+    function updateEyeDebug(samples) {
+      if (!SHOW_EYE_DEBUG) return;
+      samples.forEach((s) => {
+        if (s.debug) s.debug.material.color.setHex(!s.base ? 0x888888 : (s.covered ? 0xff0000 : 0x00ff00));
+      });
+    }
+
+    // ============================================================
+    // LINE DETECTION: is there a drawn line through a tree's spot?
+    // ============================================================
+    // Looks at every pixel in a 5 mm disc around the spot. The paper's white is taken from the
+    // brighter pixels of that same disc, so it doesn't matter whether the line was drawn before or after opening.
+    function lineAtSpot(paper) {
+      const c = paperToEyePixel(paper.x, paper.y);
+      const e = paperToEyePixel(paper.x + LINE_CATCH_RADIUS_CM, paper.y);
+      const r = Math.hypot(e.x - c.x, e.y - c.y);
+      if (r < 2) return false;                                   // too far away to see
+      const w = eyeCanvas.width, h = eyeCanvas.height;
+      const x0 = Math.floor(c.x - r), x1 = Math.ceil(c.x + r);
+      const y0 = Math.floor(c.y - r), y1 = Math.ceil(c.y + r);
+      if (x0 < 0 || y0 < 0 || x1 >= w || y1 >= h) return false;   // spot is outside the camera view
+
+      const values = [];
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const dx = x - c.x, dy = y - c.y;
+          if (dx * dx + dy * dy <= r * r) values.push(pixelLum(x, y));
+        }
+      }
+      if (values.length < 12) return false;
+      const sorted = values.slice().sort((a, b) => a - b);
+      const paperWhite = sorted[Math.floor(sorted.length * 0.8)];   // the bright 80th percentile = the paper
+      if (paperWhite < 70) return false;                          // too dark: covered by a hand, or bad light
+
+      const inkLimit = paperWhite * 0.62;
+      const ink = values.filter(v => v < inkLimit).length;
+      const inkFraction = ink / values.length;
+      return ink >= Math.max(3, values.length * 0.01) && inkFraction <= 0.35;   // a line, not a finger
+    }
+
+    function updateLines() {
+      let changed = false;
+      treesOnPage().forEach(({ tree, paper }) => {
+        if (foundTrees.has(tree.id)) return;
+        if (lineAtSpot(paper)) {
+          const n = (lineStreak.get(tree.id) || 0) + 1;
+          lineStreak.set(tree.id, n);
+          if (n >= LINE_CONFIRM_TICKS) { foundTrees.add(tree.id); changed = true; }
+        } else {
+          lineStreak.set(tree.id, 0);
+        }
+      });
+      if (changed) buildTreeDots();
+    }
+
+    // ============================================================
+    // FINGER LOGIC: edition circles
+    // ============================================================
+    const editionHold = { index: null, start: 0, waitRelease: false };
+
+    function fingerOnCircle(c) {
+      const s = circleSamples(c.x, c.y);
+      const innerCovered = s.inner.filter(p => p.covered).length;
+      const outerCovered = s.outer.filter(p => p.covered).length;
+      return innerCovered >= 6 && outerCovered <= 3;      // fingertip yes, arm/hand no
+    }
+
+    function updateEditions(now) {
+      if (!editions.length) return;
+      const circles = visibleEditionCircles();
+      let fingerIndex = null;
+      circles.forEach((c, i) => { if (fingerIndex === null && fingerOnCircle(c)) fingerIndex = i; });
+
+      let progress = 0;
+      if (fingerIndex === null) {
+        editionHold.index = null;
+        editionHold.waitRelease = false;
+      } else if (!editionHold.waitRelease) {
+        if (editionHold.index !== fingerIndex) { editionHold.index = fingerIndex; editionHold.start = now; }
+        progress = (now - editionHold.start) / HOLD_MS;
+        if (progress >= 1) {
+          const chosen = circles[fingerIndex].edition;
+          if (editionExpanded) { selectedEdition = chosen; editionExpanded = false; }
+          else { editionExpanded = true; }
+          editionHold.waitRelease = true;
+          progress = 0;
+          buildEditionRow();
+          buildTreeDots();
+          refreshStatus();
+        }
+      }
+      paintEditionFills(editionHold.waitRelease ? null : editionHold.index, progress);
+    }
+
+    // ============================================================
+    // FINGER LOGIC: scale slider
+    // ============================================================
+    const slider = { grabbed: false, holdY: null, holdStart: 0, lastSeen: 0 };
+
+    function findFingerOnSlider() {
+      const runs = [];
+      let runStart = null, gap = 0;
+      sliderSamples.forEach((s, i) => {
+        if (s.covered) { if (runStart === null) runStart = i; gap = 0; }
+        else if (runStart !== null) {
+          gap++;
+          if (gap > 1) { runs.push([runStart, i - gap]); runStart = null; gap = 0; }
+        }
+      });
+      if (runStart !== null) runs.push([runStart, sliderSamples.length - 1 - gap]);
+
+      let finger = null;
+      for (const [a, b] of runs) {
+        const lengthCm = (b - a + 1) * SLIDER_STEP_CM;
+        if (lengthCm > 4.5) return null;                     // arm or hand: ignore
+        if (lengthCm >= 0.5 && lengthCm <= 3.5 && finger === null) {
+          finger = (sliderSamples[a].yCm + sliderSamples[b].yCm) / 2;
+        }
+      }
+      return finger;
+    }
+
+    function yToScaleT(yCm) {
+      return Math.min(1, Math.max(0, (SLIDER_CM.bottomY - yCm) / SLIDER_LENGTH_CM));
+    }
+
+    function updateSlider(now) {
+      const fingerY = findFingerOnSlider();
+      let progress = 0;
+
+      if (fingerY !== null) {
+        slider.lastSeen = now;
+        if (slider.grabbed) {
+          scaleT += (yToScaleT(fingerY) - scaleT) * 0.5;
+          sliderNote = 'sliding…';
+        } else {
+          if (slider.holdY === null || Math.abs(fingerY - slider.holdY) > 0.8) { slider.holdY = fingerY; slider.holdStart = now; }
+          progress = (now - slider.holdStart) / HOLD_MS;
+          if (progress >= 1) { slider.grabbed = true; scaleT = yToScaleT(fingerY); sliderNote = 'sliding…'; }
+        }
+      } else if (now - slider.lastSeen > 500) {
+        if (slider.grabbed) sliderNote = '';
+        slider.grabbed = false;
+        slider.holdY = null;
+      }
+
+      if (!slider.grabbed && slider.holdY !== null && progress > 0) {
+        const p = cmToPage(SLIDER_CM.x, slider.holdY);
+        holdMarker.position.set(p.x, p.y, 0.0025);
+        holdMarker.material.opacity = Math.min(progress, 1);
+      } else {
+        holdMarker.material.opacity = 0;
+      }
+
+      placeTick();
+      if (builtScaleT === null || Math.abs(scaleT - builtScaleT) > 0.002 || builtEdition !== selectedEdition) {
+        buildTreeDots();
+      }
     }
 
     // ============================================================
@@ -209,16 +673,31 @@
     // ============================================================
     async function startAR() {
       document.getElementById('start').style.display = 'none';
-      statusEl.style.display = 'block';
-      setStatus('Loading the archive…');
+      statusEl.style.display = SHOW_STATUS ? 'block' : 'none';
+      statusEl.textContent = 'Loading the archive…';
 
-      // Wait for Firestore
-      let dataMessage = '';
+      const gpsPromise = (CENTER_MODE === 'gps') ? getGpsPosition() : Promise.resolve(null);
+
       try {
         await treesReady;
-        dataMessage = trees.length + ' trees · editions: ' + (editions.length ? editions.join(', ') : 'none');
+        if (!editions.length) dataProblem = 'No trees with an edition yet';
       } catch (err) {
-        dataMessage = 'Could not read the archive: ' + err.message;
+        console.error(err);
+        dataProblem = 'Could not read the archive: ' + err.message;
+      }
+
+      if (CENTER_MODE === 'nearFirstTree' && trees.length) {
+        const t = trees[0];
+        center = {
+          lat: t.latitude - 20 / 111320,
+          lon: t.longitude - 10 / (111320 * Math.cos(t.latitude * DEG)),
+          source: 'test centre near "' + t.title + '"'
+        };
+      } else {
+        const gps = await gpsPromise;
+        center = gps
+          ? { lat: gps.lat, lon: gps.lon, source: 'GPS ±' + Math.round(gps.accuracy) + ' m' }
+          : { lat: POINT_NEMO.lat, lon: POINT_NEMO.lon, source: 'Point Nemo (no location)' };
       }
 
       const mindarThree = new MindARThree({
@@ -228,21 +707,69 @@
         uiLoading: 'yes'
       });
       const { renderer, scene, camera } = mindarThree;
-
-      // Anchor 0 = the Biped Gazette frame
       const anchor = mindarThree.addAnchor(0);
 
-      buildEditionRow(anchor.group);
-      buildScaleTick(anchor.group);
-      if (SHOW_DEBUG_OUTLINE) buildDebugOutline(anchor.group);
+      editionGroup  = new THREE.Group(); anchor.group.add(editionGroup);
+      treeGroup     = new THREE.Group(); anchor.group.add(treeGroup);
+      eyeDebugGroup = new THREE.Group(); anchor.group.add(eyeDebugGroup);
 
-      setStatus('Looking for the map… · ' + dataMessage);
-      anchor.onTargetFound = () => { setStatus('Map found · ' + dataMessage); };
-      anchor.onTargetLost  = () => { setStatus('Looking for the map… · ' + dataMessage); };
+      tickMesh = new THREE.Mesh(new THREE.PlaneGeometry(cmToUnits(0.6), cmToUnits(0.1)), new THREE.MeshBasicMaterial({ color: GREEN }));
+      anchor.group.add(tickMesh);
+      holdMarker = new THREE.Mesh(
+        new THREE.PlaneGeometry(cmToUnits(0.6), cmToUnits(0.1)),
+        new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0 })
+      );
+      anchor.group.add(holdMarker);
+
+      if (SHOW_DEBUG_OUTLINE) {
+        const tl = cmToPage(BLANK_AREA_CM.left, BLANK_AREA_CM.top);
+        const tr = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.top);
+        const br = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.bottom);
+        const bl = cmToPage(BLANK_AREA_CM.left, BLANK_AREA_CM.bottom);
+        const geometry = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(tl.x, tl.y, 0.001), new THREE.Vector3(tr.x, tr.y, 0.001),
+          new THREE.Vector3(br.x, br.y, 0.001), new THREE.Vector3(bl.x, bl.y, 0.001)
+        ]);
+        anchor.group.add(new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({ color: GREEN })));
+      }
+
+      buildEditionRow();
+      placeTick();
+      buildTreeDots();
+
+      const samples = allSamples();
+      buildEyeDebug(samples);
+
+      anchor.onTargetFound = () => { mapFound = true;  refreshStatus(); };
+      anchor.onTargetLost  = () => { mapFound = false; refreshStatus(); };
+      refreshStatus();
 
       await mindarThree.start();
+      const video = mindarThree.video;
+
+      let lastEye = 0;
       renderer.setAnimationLoop(() => {
         renderer.render(scene, camera);
+
+        const now = performance.now();
+        if (!mapFound || now - lastEye < EYE_TICK_MS) return;
+        lastEye = now;
+        if (!captureFrame(video)) return;
+
+        anchor.group.updateMatrixWorld(true);
+        view = {
+          anchorGroup: anchor.group,
+          camera,
+          canvasRect: renderer.domElement.getBoundingClientRect(),
+          videoRect: video.getBoundingClientRect()
+        };
+
+        readSamples(samples);
+        updateEyeDebug(samples);
+        updateEditions(now);
+        updateSlider(now);
+        updateLines();
+        refreshStatus();
       });
     }
 
