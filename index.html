@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>The Biped Gazette</title>
+
+  <!-- Where the libraries come from (loaded from the internet) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+    }
+  }
+  </script>
+
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: Georgia, serif; }
+    #ar { position: fixed; inset: 0; }
+    #start {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: #fff; color: #000; text-align: center; cursor: pointer;
+    }
+    #start h1 { font-size: 28px; margin: 0 0 12px 0; letter-spacing: 1px; }
+    #start p  { font-size: 16px; margin: 0; }
+    #status {
+      position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5;
+      background: rgba(255,255,255,0.9); color: #000; padding: 6px 12px; border-radius: 4px;
+      font-size: 14px; display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="start">
+    <h1>THE BIPED GAZETTE</h1>
+    <p>Tap to begin</p>
+  </div>
+  <div id="status">Looking for the map…</div>
+  <div id="ar"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { MindARThree } from 'mindar-image-three';
+
+    // ------------------------------------------------------------
+    // PAPER SETTINGS (from InDesign, in cm, measured from the page's top-left corner)
+    // ------------------------------------------------------------
+    const PAGE_WIDTH_CM  = 21.0;   // A4 portrait width
+    const PAGE_HEIGHT_CM = 29.7;   // A4 portrait height
+
+    const BLANK_AREA_CM = {
+      left:   3.24,
+      top:    3.11,
+      right: 17.74,
+      bottom: 26.61
+    };
+
+    // MindAR measures the page in "page widths": the page is 1 unit wide,
+    // its centre is (0, 0), x goes right, y goes up.
+    function cmToPage(xCm, yCm) {
+      return {
+        x: (xCm - PAGE_WIDTH_CM / 2) / PAGE_WIDTH_CM,
+        y: (PAGE_HEIGHT_CM / 2 - yCm) / PAGE_WIDTH_CM
+      };
+    }
+
+    const GREEN = 0x00ff00;
+    const statusEl = document.getElementById('status');
+
+    async function startAR() {
+      document.getElementById('start').style.display = 'none';
+      statusEl.style.display = 'block';
+
+      const mindarThree = new MindARThree({
+        container: document.getElementById('ar'),
+        imageTargetSrc: './targets.mind',
+        uiScanning: 'no',
+        uiLoading: 'yes'
+      });
+
+      const { renderer, scene, camera } = mindarThree;
+
+      // Anchor 0 = the first (and only) image in targets.mind: the Biped Gazette frame
+      const anchor = mindarThree.addAnchor(0);
+
+      // 1) Small green square at the centre of the page (2 cm wide)
+      const squareSize = 2 / PAGE_WIDTH_CM;
+      const square = new THREE.Mesh(
+        new THREE.PlaneGeometry(squareSize, squareSize),
+        new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.7 })
+      );
+      anchor.group.add(square);
+
+      // 2) Thin green outline of the blank area, from the four InDesign corners
+      const tl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.top);
+      const tr = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.top);
+      const br = cmToPage(BLANK_AREA_CM.right, BLANK_AREA_CM.bottom);
+      const bl = cmToPage(BLANK_AREA_CM.left,  BLANK_AREA_CM.bottom);
+
+      const outlineGeometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(tl.x, tl.y, 0.001),
+        new THREE.Vector3(tr.x, tr.y, 0.001),
+        new THREE.Vector3(br.x, br.y, 0.001),
+        new THREE.Vector3(bl.x, bl.y, 0.001)
+      ]);
+      const outline = new THREE.LineLoop(outlineGeometry, new THREE.LineBasicMaterial({ color: GREEN }));
+      anchor.group.add(outline);
+
+      // Status messages
+      anchor.onTargetFound = () => { statusEl.textContent = 'Map found'; };
+      anchor.onTargetLost  = () => { statusEl.textContent = 'Looking for the map…'; };
+
+      await mindarThree.start();
+      renderer.setAnimationLoop(() => {
+        renderer.render(scene, camera);
+      });
+    }
+
+    document.getElementById('start').addEventListener('click', startAR, { once: true });
+  </script>
+</body>
+</html>
